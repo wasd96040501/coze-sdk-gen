@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"regexp"
@@ -11,22 +12,50 @@ import (
 	"text/template"
 
 	"github.com/coze-dev/coze-sdk-gen/parser"
+	"gopkg.in/yaml.v3"
 )
 
 //go:embed templates/sdk.tmpl
 var templateFS embed.FS
 
-// Generator handles Python SDK generation
-type Generator struct{}
+//go:embed config.yaml
+var configFS embed.FS
 
-// pythonTypeMapping maps OpenAPI types to Python types
-var pythonTypeMapping = map[string]string{
-	"string":  "str",
-	"integer": "int",
-	"number":  "float",
-	"boolean": "bool",
-	"array":   "List",
-	"object":  "dict",
+type PagedOperationConfig struct {
+	Enabled      bool              `yaml:"enabled"`
+	ParamMapping map[string]string `yaml:"param_mapping"`
+	// esponseClass string            `yaml:"response_class"`
+	ItemType string `yaml:"item_type"`
+}
+
+type ModuleConfig struct {
+	EnumNameMapping           map[string]string               `yaml:"enum_name_mapping"`
+	OperationNameMapping      map[string]string               `yaml:"operation_name_mapping"`
+	ResponseTypeModify        map[string]string               `yaml:"response_type_modify"`
+	TypeMapping               map[string]string               `yaml:"type_mapping"`
+	SkipOptionalFieldsClasses []string                        `yaml:"skip_optional_fields_classes"`
+	PagedOperations           map[string]PagedOperationConfig `yaml:"paged_operations"`
+}
+
+type Config struct {
+	Modules map[string]ModuleConfig `yaml:"modules"`
+}
+
+// Generator handles Python SDK generation using parser2
+type Generator struct {
+	classes    []PythonClass
+	config     Config
+	moduleName string
+}
+
+// pythonTypeMapping maps our types to Python types
+var pythonTypeMapping = map[parser.PrimitiveKind]string{
+	parser.PrimitiveString:  "str",
+	parser.PrimitiveInt:     "int",
+	parser.PrimitiveFloat:   "float",
+	parser.PrimitiveBool:    "bool",
+	parser.PrimitiveBinary:  "bytes",
+	parser.PrimitiveUnknown: "Any",
 }
 
 // PythonClass represents a Python class
@@ -34,9 +63,12 @@ type PythonClass struct {
 	Name        string
 	Description string
 	Fields      []PythonField
+	Methods     []string
 	BaseClass   string
 	IsEnum      bool
 	EnumValues  []PythonEnumValue
+	ShouldSkip  bool
+	IsPass      bool
 }
 
 // PythonEnumValue represents a Python enum value
@@ -51,6 +83,8 @@ type PythonField struct {
 	Name        string
 	Type        string
 	Description string
+	IsMethod    bool
+	Default     string
 }
 
 // PythonOperation represents a Python API operation
@@ -70,6 +104,13 @@ type PythonOperation struct {
 	HeaderParams        []PythonParam
 	HasHeaders          bool
 	StaticHeaders       map[string]string
+	// page
+	IsPaged           bool
+	ResponseCast      string
+	AsyncResponseType string
+	PageIndexName     string
+	PageSizeName      string
+	HasFileUpload     bool
 }
 
 // PythonParam represents a Python parameter
@@ -79,13 +120,75 @@ type PythonParam struct {
 	Type         string
 	Description  string
 	DefaultValue string
+	HasDefault   bool
 	IsModel      bool
 }
 
+// PythonModule represents a converted Python module
+type PythonModule struct {
+	Operations    []PythonOperation
+	Classes       []PythonClass
+	HasFileUpload bool
+}
+
+func (g *Generator) loadConfig() error {
+	configData, err := configFS.ReadFile("config.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to read config.yaml: %w", err)
+	}
+
+	if err := yaml.Unmarshal(configData, &g.config); err != nil {
+		return fmt.Errorf("failed to parse config.yaml: %w", err)
+	}
+
+	return nil
+}
+
 // Generate generates Python SDK code from parsed OpenAPI data
-func (g Generator) Generate(ctx context.Context, yamlContent []byte) (map[string]string, error) {
-	p := parser.Parser{}
-	modules, _, err := p.ParseOpenAPI(ctx, yamlContent)
+func (g *Generator) Generate(ctx context.Context, yamlContent []byte) (map[string]string, error) {
+	// Load config first
+	if err := g.loadConfig(); err != nil {
+		return nil, err
+	}
+
+	// Create new parser2 instance
+	p, err := parser.NewParser(&parser.ModuleConfig{
+		GenerateUnnamedResponseType: func(h *parser.HttpHandler) (string, bool) {
+			if h.GetActualResponseBody() == nil {
+				return fmt.Sprintf("%sResp", h.Name), true
+			}
+
+			return "", false
+		},
+		ChangeHttpHandlerResponseType: map[string]string{
+			"CreateDraftBot":  "Bot",
+			"UpdateDraftBot":  "Bot",
+			"PublishDraftBot": "Bot",
+		},
+		RenameTypes: map[string]string{
+			"SpacePublishedBotsInfo": "_PrivateListBotsData",
+		},
+		RenameHandlers: map[string]string{
+			"RetrieveFileOpen": "retrieve",
+			"UploadFileOpen":   "upload",
+		},
+		ChangeFields: map[string]map[string]*parser.FieldModification{
+			"File": {
+				"id": {
+					Requirement: parser.FieldRequirementRequired,
+				},
+			},
+		},
+		HandlerOrdering: map[string][]string{
+			"files": {"UploadFileOpen", "RetrieveFileOpen"},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create parser2 failed: %w", err)
+	}
+
+	// Parse OpenAPI spec
+	modules, err := p.ParseOpenAPI(yamlContent)
 	if err != nil {
 		return nil, fmt.Errorf("parse OpenAPI failed: %w", err)
 	}
@@ -94,7 +197,11 @@ func (g Generator) Generate(ctx context.Context, yamlContent []byte) (map[string
 	files := make(map[string]string)
 
 	// Read template
-	tmpl, err := template.New("python").Parse(g.getTemplate())
+	tmpl, err := template.New("python").Funcs(template.FuncMap{
+		"title": func(x string) string {
+			return strings.ReplaceAll(strings.Title(x), ".", "")
+		},
+	}).Parse(g.getTemplate())
 	if err != nil {
 		return nil, fmt.Errorf("parse template failed: %w", err)
 	}
@@ -104,9 +211,10 @@ func (g Generator) Generate(ctx context.Context, yamlContent []byte) (map[string
 		pythonModule := g.convertModule(module)
 		var buf bytes.Buffer
 		err = tmpl.Execute(&buf, map[string]interface{}{
-			"ModuleName": moduleName,
-			"Operations": pythonModule.Operations,
-			"Classes":    pythonModule.Classes,
+			"ModuleName":    moduleName,
+			"Operations":    pythonModule.Operations,
+			"Classes":       pythonModule.Classes,
+			"HasFileUpload": pythonModule.HasFileUpload,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("execute template failed: %w", err)
@@ -117,159 +225,207 @@ func (g Generator) Generate(ctx context.Context, yamlContent []byte) (map[string
 	return files, nil
 }
 
-func (g Generator) convertModule(module parser.Module) struct {
-	Operations []PythonOperation
-	Classes    []PythonClass
-} {
-	operations := make([]PythonOperation, 0, len(module.Operations))
-	for _, op := range module.Operations {
-		operations = append(operations, g.convertOperation(op))
+func (g *Generator) convertModule(module *parser.Module) PythonModule {
+	// Store current module name
+	g.moduleName = module.Name
+
+	// Convert types to classes
+	classes := make([]PythonClass, 0)
+	for _, ty := range module.Types {
+		if pythonClass := g.convertType(ty); pythonClass != nil {
+			classes = append(classes, *pythonClass)
+		}
+	}
+	g.classes = classes
+
+	// Convert operations
+	operations := make([]PythonOperation, 0)
+	hasFileUpload := false
+	for _, handler := range module.HttpHandlers {
+		if op := g.convertHandler(&handler); op != nil {
+			operations = append(operations, *op)
+			if op.HasFileUpload {
+				hasFileUpload = true
+			}
+		}
 	}
 
-	classes := make([]PythonClass, 0, len(module.Classes))
-	for _, class := range module.Classes {
-		classes = append(classes, g.convertClass(class))
-	}
-
-	return struct {
-		Operations []PythonOperation
-		Classes    []PythonClass
-	}{
-		Operations: operations,
-		Classes:    classes,
+	return PythonModule{
+		Operations:    operations,
+		Classes:       classes,
+		HasFileUpload: hasFileUpload,
 	}
 }
 
-func (g Generator) convertClass(class parser.Class) PythonClass {
-	pythonClass := PythonClass{
-		Name:        class.Name,
-		Description: g.formatDescription(class.Description),
+func (g *Generator) convertType(ty *parser.Ty) *PythonClass {
+	if !ty.IsNamed {
+		return nil
+	}
+
+	// Apply type mapping if exists
+	if g.config.Modules[g.moduleName].TypeMapping[ty.Name] != "" {
+		ty.Name = g.config.Modules[g.moduleName].TypeMapping[ty.Name]
+	}
+
+	pythonClass := &PythonClass{
+		Name:        ty.Name,
+		Description: g.formatDescription(ty.Description),
 		BaseClass:   "CozeModel",
 	}
 
-	if class.IsEnum {
+	// Handle enums
+	if len(ty.EnumValues) > 0 {
 		pythonClass.IsEnum = true
 		pythonClass.BaseClass = "IntEnum"
-		for _, value := range class.EnumValues {
+		for _, value := range ty.EnumValues {
 			pythonClass.EnumValues = append(pythonClass.EnumValues, PythonEnumValue{
-				Name:        value.Name,
-				Value:       fmt.Sprintf("%v", value.Value),
-				Description: value.Description,
+				Name:  g.toEnumName(value.Name),
+				Value: fmt.Sprintf("%v", value.Val),
 			})
 		}
 		return pythonClass
 	}
 
-	// Track required fields
-	requiredFields := make(map[string]bool)
-	for _, fieldName := range class.Fields {
-		if fieldName.Required {
-			requiredFields[fieldName.Name] = true
+	// Skip optional fields for configured classes
+	skipOptionalFields := false
+	if moduleConfig, ok := g.config.Modules[g.moduleName]; ok {
+		for _, skipClass := range moduleConfig.SkipOptionalFieldsClasses {
+			if skipClass == ty.Name {
+				skipOptionalFields = true
+				break
+			}
 		}
 	}
 
-	for _, field := range class.Fields {
-		fieldType := g.getFieldType(field.Schema)
-		if !field.Required {
+	// Convert fields
+	for _, field := range ty.Fields {
+		fieldType := g.getFieldType(field.Type)
+		if !field.Required && !skipOptionalFields {
 			fieldType = fmt.Sprintf("Optional[%s]", fieldType)
 		}
+
 		pythonField := PythonField{
 			Name:        g.toPythonVarName(field.Name),
 			Type:        fieldType,
 			Description: g.formatDescription(field.Description),
+			Default:     field.Default,
+		}
+		if pythonField.Default == "" && !field.Required {
+			pythonField.Default = "None"
 		}
 		pythonClass.Fields = append(pythonClass.Fields, pythonField)
+	}
+
+	if ty.HasOnlyStatusFields() {
+		pythonClass.IsPass = true
 	}
 
 	return pythonClass
 }
 
-func (g Generator) convertOperation(op parser.Operation) PythonOperation {
-	operation := PythonOperation{
-		Name:                g.toPythonMethodName(op.Name),
-		Description:         op.Description,
-		Path:                op.Path,
-		Method:              op.Method,
-		ResponseDescription: op.ResponseDescription,
+func removeOptional(t string) string {
+	if strings.HasPrefix(t, "Optional[") && strings.HasSuffix(t, "]") {
+		return t[9 : len(t)-1]
+	}
+	return t
+}
+
+func marshal(v any) string {
+	res, _ := json.Marshal(v)
+	return string(res)
+}
+
+func (g *Generator) convertHandler(handler *parser.HttpHandler) *PythonOperation {
+	operation := &PythonOperation{
+		Name:        g.toPythonMethodName(handler.Name),
+		Description: handler.Description,
+		Path:        handler.Path,
+		Method:      strings.ToUpper(handler.Method),
 	}
 
-	// Handle parameters
+	// Convert parameters
 	var headerParams []PythonParam
-	var staticHeaders = make(map[string]string)
-	for _, param := range op.Parameters {
-		// Check if it's a header parameter with single enum value
-		if param.In == "header" && param.Schema.Enum != nil && len(param.Schema.Enum) == 1 {
-			// Use the single enum value directly
-			staticHeaders[param.JsonName] = fmt.Sprintf("%v", param.Schema.Enum[0])
-			continue
-		}
+	staticHeaders := make(map[string]string)
 
-		pythonType := g.getFieldType(param.Schema)
-		if !param.Required {
-			pythonType = fmt.Sprintf("Optional[%s]", pythonType)
-		}
-
-		pythonParam := PythonParam{
-			Name:        g.toPythonVarName(param.Name),
-			JsonName:    param.JsonName,
-			Type:        pythonType,
-			Description: param.Description,
-		}
-
-		if !param.Required {
-			pythonParam.DefaultValue = "None"
-		}
-
-		// Check if parameter is a model type
-		if param.Schema.Ref != "" {
-			pythonParam.IsModel = true
-		}
-
+	// Handle path parameters
+	for _, param := range handler.PathParams {
+		pythonParam := g.convertParam(&param)
 		operation.Params = append(operation.Params, pythonParam)
-		if param.In == "query" {
-			operation.QueryParams = append(operation.QueryParams, pythonParam)
-			operation.HasQueryParams = true
-		} else if param.In == "header" {
-			headerParams = append(headerParams, pythonParam)
-		}
+	}
+
+	// Handle query parameters
+	for _, param := range handler.QueryParams {
+		pythonParam := g.convertParam(&param)
+		operation.QueryParams = append(operation.QueryParams, pythonParam)
+		operation.Params = append(operation.Params, pythonParam)
+		operation.HasQueryParams = true
+	}
+
+	// Handle header parameters
+	for _, param := range handler.HeaderParams {
+		pythonParam := g.convertParam(&param)
+		headerParams = append(headerParams, pythonParam)
+		operation.Params = append(operation.Params, pythonParam)
 	}
 
 	// Handle request body
-	if op.RequestBody != nil {
+	if handler.RequestBody != nil {
 		operation.HasBody = true
-		for name, prop := range op.RequestBody.Schema.Properties {
-			pythonType := g.getFieldType(prop)
-			// Request body fields are optional unless explicitly required
-			isRequired := false
-			for _, req := range op.RequestBody.Schema.Required {
-				if req == name {
-					isRequired = true
-					break
+		switch handler.ContentType {
+		case parser.ContentTypeFile:
+			operation.HasFileUpload = true
+			for _, field := range handler.RequestBody.Fields {
+				pythonParam := g.convertParam(&field)
+				if field.Type.PrimitiveKind == parser.PrimitiveBinary {
+					pythonParam.Type = "FileTypes"
 				}
+				operation.BodyParams = append(operation.BodyParams, pythonParam)
+				operation.Params = append(operation.Params, pythonParam)
 			}
-			if !isRequired {
-				pythonType = fmt.Sprintf("Optional[%s]", pythonType)
+		case parser.ContentTypeJson:
+			for _, field := range handler.RequestBody.Fields {
+				pythonParam := g.convertParam(&field)
+				operation.BodyParams = append(operation.BodyParams, pythonParam)
+				operation.Params = append(operation.Params, pythonParam)
 			}
-
-			pythonParam := PythonParam{
-				Name:        g.toPythonVarName(name),
-				JsonName:    name,
-				Type:        pythonType,
-				Description: prop.Description,
-				IsModel:     prop.Ref != "" || (prop.Type == parser.SchemaTypeArray && prop.Items != nil && prop.Items.Ref != ""),
-			}
-			if !isRequired {
-				pythonParam.DefaultValue = "None"
-			}
-			operation.Params = append(operation.Params, pythonParam)
-			operation.BodyParams = append(operation.BodyParams, pythonParam)
+		default:
+			panic(fmt.Sprintf("unsupported content type %q", handler.ContentType))
 		}
 	}
 
-	// Handle response
-	operation.ResponseType = g.getFieldType(op.ResponseSchema)
+	// Handle response body using GetActualResponseBody
+	if actualBody := handler.GetActualResponseBody(); actualBody != nil {
+		operation.ResponseType = g.getFieldType(actualBody)
+	} else if handler.ResponseBody != nil {
+		operation.ResponseType = g.getFieldType(handler.ResponseBody)
+	}
 
-	// Update template to include headers
+	// Check if this is a paged operation using GetPageInfo
+	if pageInfo := handler.GetPageInfo(nil, nil); pageInfo != nil {
+		operation.IsPaged = true
+		if b := handler.GetActualResponseBody(); b != nil {
+			operation.ResponseCast = g.getFieldType(handler.GetActualResponseBody())
+		} else {
+			operation.ResponseCast = "unknown_paged_response"
+		}
+		operation.ResponseType = fmt.Sprintf("NumberPaged[%s]", pageInfo.ItemType.Name)
+		operation.AsyncResponseType = fmt.Sprintf("AsyncNumberPaged[%s]", pageInfo.ItemType.Name)
+		operation.PageIndexName = g.toPythonVarName(pageInfo.PageIndexName)
+		operation.PageSizeName = g.toPythonVarName(pageInfo.PageSizeName)
+
+		for i, param := range operation.Params {
+			if param.Name == operation.PageIndexName {
+				operation.Params[i].DefaultValue = "1"
+				operation.Params[i].Type = removeOptional(operation.Params[i].Type)
+			}
+			if param.Name == operation.PageSizeName {
+				operation.Params[i].DefaultValue = "20"
+				operation.Params[i].Type = removeOptional(operation.Params[i].Type)
+			}
+		}
+	}
+
+	// Update headers
 	if len(headerParams) > 0 || len(staticHeaders) > 0 {
 		operation.HeaderParams = headerParams
 		operation.StaticHeaders = staticHeaders
@@ -279,44 +435,66 @@ func (g Generator) convertOperation(op parser.Operation) PythonOperation {
 	return operation
 }
 
-func (g Generator) getFieldType(schema parser.Schema) string {
-	// If it's a reference, use the referenced type name
-	if schema.Ref != "" {
-		parts := strings.Split(schema.Ref, "/")
-		return parts[len(parts)-1]
+func (g *Generator) convertParam(field *parser.TyField) PythonParam {
+	fieldType := g.getFieldType(field.Type)
+	if !field.Required {
+		fieldType = fmt.Sprintf("Optional[%s]", fieldType)
 	}
 
-	// Handle arrays
-	if schema.Type == parser.SchemaTypeArray && schema.Items != nil {
-		itemType := g.getFieldType(*schema.Items)
-		return fmt.Sprintf("List[%s]", itemType)
+	param := PythonParam{
+		Name:        g.toPythonVarName(field.Name),
+		JsonName:    field.Name,
+		Type:        fieldType,
+		Description: field.Description,
+		IsModel:     field.Type.IsNamed,
 	}
 
-	// Get base type
-	var baseType string
-	switch schema.Type {
-	case parser.SchemaTypeString:
-		baseType = pythonTypeMapping["string"]
-	case parser.SchemaTypeInteger:
-		baseType = pythonTypeMapping["integer"]
-	case parser.SchemaTypeNumber:
-		baseType = pythonTypeMapping["number"]
-	case parser.SchemaTypeBoolean:
-		baseType = pythonTypeMapping["boolean"]
-	case parser.SchemaTypeObject:
-		if len(schema.Properties) > 0 {
-			baseType = pythonTypeMapping["object"]
-		} else {
-			baseType = "Any"
-		}
-	default:
-		baseType = "Any"
+	if !field.Required {
+		param.DefaultValue = "None"
+		param.HasDefault = true
 	}
 
-	return baseType
+	return param
 }
 
-func (g Generator) formatDescription(desc string) string {
+func (g *Generator) getFieldType(ty *parser.Ty) string {
+	if ty == nil {
+		return "Any"
+	}
+
+	switch ty.Kind {
+	case parser.TyKindPrimitive:
+		if pyType, ok := pythonTypeMapping[ty.PrimitiveKind]; ok {
+			return pyType
+		}
+		return "Any"
+
+	case parser.TyKindArray:
+		if ty.ElementType != nil {
+			elemType := g.getFieldType(ty.ElementType)
+			return fmt.Sprintf("List[%s]", elemType)
+		}
+		return "List[Any]"
+
+	case parser.TyKindMap:
+		if ty.ValueType != nil {
+			valueType := g.getFieldType(ty.ValueType)
+			return fmt.Sprintf("Dict[str, %s]", valueType)
+		}
+		return "Dict[str, Any]"
+
+	case parser.TyKindObject:
+		if ty.IsNamed {
+			return ty.Name
+		}
+		return "Dict[str, Any]"
+
+	default:
+		return "Any"
+	}
+}
+
+func (g *Generator) formatDescription(desc string) string {
 	if desc == "" {
 		return desc
 	}
@@ -331,8 +509,15 @@ func (g Generator) formatDescription(desc string) string {
 	return desc
 }
 
-func (g Generator) toPythonMethodName(name string) string {
-	// Convert method names like GetBot to get_bot
+func (g *Generator) toPythonMethodName(name string) string {
+	// First check if there's a mapping in the module-specific config
+	if moduleConfig, ok := g.config.Modules[g.moduleName]; ok {
+		if mappedName, ok := moduleConfig.OperationNameMapping[name]; ok {
+			return mappedName
+		}
+	}
+
+	// If no mapping found, use the default conversion logic
 	var result strings.Builder
 	for i, r := range name {
 		if i > 0 && r >= 'A' && r <= 'Z' {
@@ -343,7 +528,7 @@ func (g Generator) toPythonMethodName(name string) string {
 	return strings.ToLower(result.String())
 }
 
-func (g Generator) toPythonVarName(name string) string {
+func (g *Generator) toPythonVarName(name string) string {
 	// Replace any non-alphanumeric characters with underscore
 	reg := regexp.MustCompile(`[^a-zA-Z0-9]+`)
 	name = reg.ReplaceAllString(name, "_")
@@ -370,7 +555,53 @@ func (g Generator) toPythonVarName(name string) string {
 	return name
 }
 
-func (g Generator) getTemplate() string {
+func (g *Generator) toEnumName(name string) string {
+	// First check if there's a mapping in the module-specific config
+	if moduleConfig, ok := g.config.Modules[g.moduleName]; ok {
+		if mappedName, ok := moduleConfig.EnumNameMapping[name]; ok {
+			return mappedName
+		}
+	}
+
+	// Check if the name is already in uppercase with underscores format
+	isUpperWithUnderscores := true
+	for i, r := range name {
+		if i > 0 && r == '_' {
+			continue
+		}
+		if r < 'A' || r > 'Z' {
+			isUpperWithUnderscores = false
+			break
+		}
+	}
+	if isUpperWithUnderscores {
+		return name
+	}
+
+	// If no mapping found and not already in correct format, use the default conversion logic
+	// First convert camelCase to snake_case
+	var result strings.Builder
+	for i, r := range name {
+		if i > 0 && r >= 'A' && r <= 'Z' {
+			result.WriteRune('_')
+		}
+		result.WriteRune(r)
+	}
+	snakeCase := strings.ToLower(result.String())
+
+	// Replace any non-alphanumeric characters with underscore
+	reg := regexp.MustCompile(`[^a-zA-Z0-9]+`)
+	name = reg.ReplaceAllString(snakeCase, "_")
+
+	// Remove consecutive underscores
+	reg = regexp.MustCompile(`_+`)
+	name = reg.ReplaceAllString(name, "_")
+
+	// Trim leading and trailing underscores and convert to uppercase
+	return strings.ToUpper(strings.Trim(name, "_"))
+}
+
+func (g *Generator) getTemplate() string {
 	// Read template from embedded file
 	templateContent, err := fs.ReadFile(templateFS, "templates/sdk.tmpl")
 	if err != nil {

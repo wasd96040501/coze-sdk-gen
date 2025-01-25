@@ -1,22 +1,47 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any{{ if .HasFileUpload }}, IO, Union, Tuple{{ end }}
 from enum import IntEnum
-from cozepy.model import CozeModel, NumberPaged, AsyncNumberPaged
+from cozepy.model import CozeModel, NumberPaged, AsyncNumberPaged, NumberPagedResponse
 from cozepy.auth import Auth
 from cozepy.request import HTTPRequest, Requester
 from cozepy.util import remove_url_trailing_slash
+{{ if .HasFileUpload }}from pathlib import Path
+import os
 
-{{ range .Classes }}{{ if .Description }}"""{{ .Description }}"""{{ end }}
-class {{ .Name }}({{ .BaseClass }}):
+FileContent = Union[IO[bytes], bytes, str, Path]
+FileTypes = Union[
+    # file (or bytes)
+    FileContent,
+    # (filename, file (or bytes))
+    Tuple[Optional[str], FileContent],
+]
+
+def _try_fix_file(file: FileTypes) -> FileTypes:
+    if isinstance(file, Path):
+        if not file.exists():
+            raise ValueError(f"File not found: {file}")
+        return open(file, "rb")
+
+    if isinstance(file, str):
+        if not os.path.isfile(file):
+            raise ValueError(f"File not found: {file}")
+        return open(file, "rb")
+
+    return file{{ end }}
+
+{{ range .Classes }}{{ if not .ShouldSkip }}{{ if .Description }}"""{{ .Description }}"""{{ end }}
+class {{ .Name }}({{ .BaseClass }}):{{ if .IsPass }}
+    pass{{ else }}
     {{ range .Fields }}{{ if .Description }}"""{{ .Description }}"""
-    {{ end }}{{ .Name }}: {{ .Type }}
+    {{ end }}{{ .Name }}: {{ .Type }} {{ if ne .Default "" }} = {{ .Default }}{{ end }}
+    {{ end }}{{ range .Methods }}{{ . }}
     {{ end }}{{ if .IsEnum }}{{ range .EnumValues }}    {{ .Name }} = {{ .Value }}  # {{ .Description }}
-    {{ end }}{{ end }}
-{{ end }}
+    {{ end }}{{ end }}{{ end }}
+{{ end }}{{ end }}
 
 """
 API Client for {{ .ModuleName }} endpoints
 """
-class Client(object):
+class {{ title .ModuleName }}Client(object):
     def __init__(self, base_url: str, auth: Auth, requester: Requester):
         self._base_url = remove_url_trailing_slash(base_url)
         self._auth = auth
@@ -30,14 +55,34 @@ class Client(object):
     def {{ .Name }}(
         self,
         *,
-        {{ range .Params }}{{ .Name }}: {{ .Type }},
+        {{ range .Params }}{{ .Name }}: {{ .Type }} {{ if .HasDefault }} = {{ .DefaultValue }}{{ end }},
         {{ end }}
     ) -> {{ .ResponseType }}:
         url = f"{self._base_url}{{ .Path }}"
         {{ if .HasHeaders }}headers = {
             {{ range $key, $value := .StaticHeaders }}"{{ $key }}": "{{ $value }}",{{ end }}{{ range .HeaderParams }}"{{ .JsonName }}": {{ .Name }},{{ end }}
         }
-        {{ end }}{{ if eq .Method "GET" }}params = {
+        {{ end }}{{ if eq .Method "GET" }}{{ if .IsPaged }}def request_maker(i_page_num: int, i_page_size: int) -> HTTPRequest:
+            return self._requester.make_request(
+                "{{ .Method }}",
+                url,
+                params={
+                    {{$page_size_name := .PageSizeName}} {{$page_index_name := .PageIndexName}}
+                    {{ range .QueryParams }}
+                    "{{ .JsonName }}": {{ if eq .Name $page_index_name }}i_page_num{{ else if eq .Name $page_size_name }}i_page_size{{ else }}{{.Name}}{{ end }},
+                    {{ end }}
+                },
+                cast={{ .ResponseCast }},
+                is_async=False,
+                stream=False,
+            )
+
+        return NumberPaged(
+            page_num={{ .PageIndexName }},
+            page_size={{ .PageSizeName }},
+            requestor=self._requester,
+            request_maker=request_maker,
+        ){{ else }}params = {
             {{ range .QueryParams }}"{{ .JsonName }}": {{ .Name }},{{ end }}
         }
         return self._requester.request(
@@ -47,6 +92,14 @@ class Client(object):
             cast={{ .ResponseType }},
             params=params,
             {{ if .HasHeaders }}headers=headers,{{ end }}
+        ){{ end }}{{ else }}{{ if .HasFileUpload }}files = {"file": _try_fix_file(file)}
+        return self._requester.request(
+            "{{ .Method }}",
+            url,
+            False,
+            cast={{ .ResponseType }},
+            {{ if .HasHeaders }}headers=headers,{{ end }}
+            files=files,
         ){{ else }}return self._requester.request(
             "{{ .Method }}",
             url,
@@ -57,15 +110,15 @@ class Client(object):
                 {{ range .QueryParams }}"{{ .JsonName }}": {{ .Name }},{{ end }}
             },{{ end }}
             {{ if .HasBody }}body={
-                {{ range .BodyParams }}"{{ .JsonName }}": {{ .Name }},{{ end }}
+                {{ range .BodyParams }}"{{ .JsonName }}": {{ .Name }}{{ if and .HasDefault .IsModel }}.model_dump() if {{ .Name }} else None{{ end }},{{ end }}
             },{{ end }}
-        ){{ end }}
+        ){{ end }}{{ end }}
     {{ end }}
 
 """
 Async API Client for {{ .ModuleName }} endpoints
 """
-class AsyncClient(object):
+class Async{{ title .ModuleName }}Client(object):
     def __init__(self, base_url: str, auth: Auth, requester: Requester):
         self._base_url = remove_url_trailing_slash(base_url)
         self._auth = auth
@@ -79,14 +132,34 @@ class AsyncClient(object):
     async def {{ .Name }}(
         self,
         *,
-        {{ range .Params }}{{ .Name }}: {{ .Type }},
+        {{ range .Params }}{{ .Name }}: {{ .Type }} {{ if .HasDefault }} = {{ .DefaultValue }}{{ end }},
         {{ end }}
-    ) -> {{ .ResponseType }}:
+    ) -> {{ if .IsPaged }}{{ .AsyncResponseType }}{{ else }}{{ .ResponseType }}{{ end }}:
         url = f"{self._base_url}{{ .Path }}"
         {{ if .HasHeaders }}headers = {
             {{ range $key, $value := .StaticHeaders }}"{{ $key }}": "{{ $value }}",{{ end }}{{ range .HeaderParams }}"{{ .JsonName }}": {{ .Name }},{{ end }}
         }
-        {{ end }}{{ if eq .Method "GET" }}params = {
+        {{ end }}{{ if eq .Method "GET" }}{{ if .IsPaged }}def request_maker(i_page_num: int, i_page_size: int) -> HTTPRequest:
+            return self._requester.make_request(
+                "{{ .Method }}",
+                url,
+                params={
+                    {{$page_size_name := .PageSizeName}} {{$page_index_name := .PageIndexName}}
+                    {{ range .QueryParams }}
+                    "{{ .JsonName }}": {{ if eq .Name $page_index_name }}i_page_num{{ else if eq .Name $page_size_name }}i_page_size{{ else }}{{.Name}}{{ end }},
+                    {{ end }}
+                },
+                cast={{ .ResponseCast }},
+                is_async=True,
+                stream=False,
+            )
+
+        return await AsyncNumberPaged.build(
+            page_num={{ .PageIndexName }},
+            page_size={{ .PageSizeName }},
+            requestor=self._requester,
+            request_maker=request_maker,
+        ){{ else }}params = {
             {{ range .QueryParams }}"{{ .JsonName }}": {{ .Name }},{{ end }}
         }
         return await self._requester.arequest(
@@ -96,6 +169,14 @@ class AsyncClient(object):
             cast={{ .ResponseType }},
             params=params,
             {{ if .HasHeaders }}headers=headers,{{ end }}
+        ){{ end }}{{ else }}{{ if .HasFileUpload }}files = {"file": _try_fix_file(file)}
+        return await self._requester.arequest(
+            "{{ .Method }}",
+            url,
+            False,
+            cast={{ .ResponseType }},
+            {{ if .HasHeaders }}headers=headers,{{ end }}
+            files=files,
         ){{ else }}return await self._requester.arequest(
             "{{ .Method }}",
             url,
@@ -106,7 +187,7 @@ class AsyncClient(object):
                 {{ range .QueryParams }}"{{ .JsonName }}": {{ .Name }},{{ end }}
             },{{ end }}
             {{ if .HasBody }}body={
-                {{ range .BodyParams }}"{{ .JsonName }}": {{ .Name }},{{ end }}
+                {{ range .BodyParams }}"{{ .JsonName }}": {{ .Name }}{{ if and .HasDefault .IsModel }}.model_dump() if {{ .Name }} else None{{ end }},{{ end }}
             },{{ end }}
-        ){{ end }}
+        ){{ end }}{{ end }}
     {{ end }}
